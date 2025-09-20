@@ -1,0 +1,501 @@
+# CREWAI-IMAP COMPLETE DATABASE RECREATION GUIDE
+Generated: 2025-01-19 @ epoch 1758228125
+
+## OVERVIEW
+This document provides EVERYTHING needed to completely recreate the PostgreSQL database schema for the CrewAI IMAP agent system. It includes both the complete DDL export and comprehensive documentation.
+
+## QUICK RECREATION STEPS
+```bash
+# 1. Create database
+createdb -U postgres crewai_imap
+
+# 2. Restore schema from DDL
+psql -U postgres -d crewai_imap -f candidate.ddl.1758228125.sql
+
+# 3. Verify recreation
+psql -U postgres -d crewai_imap -c "\d+"
+```
+
+---
+
+## COMPLETE DDL STRUCTURE
+
+**File**: `candidate.ddl.1758228125.sql` (1,106 lines)
+**Content**: Full pg_dump schema export with:
+- All table definitions with constraints
+- All sequences and ownership
+- All indexes (primary, unique, performance)
+- All foreign key relationships
+- All views with complete definitions
+- All check constraints and validations
+- Proper dependency ordering for recreation
+
+**Database Recreation**:
+The DDL file contains the complete schema definition that can recreate the entire database structure with a single command:
+```sql
+psql -U postgres -d crewai_imap -f candidate.ddl.1758228125.sql
+```
+
+---
+
+## CURRENT DATABASE STATE
+- **Total Size**: ~2.5MB
+- **Tables**: 14 core tables + 3 analytical views
+- **Sequences**: 14 auto-increment sequences
+- **Indexes**: 25+ performance and constraint indexes
+- **Foreign Keys**: 15+ referential integrity constraints
+
+**Data Volume**:
+- **585 emails** (2.44MB in emails table)
+- **54 recruiter emails** classified
+- **10 positions** identified
+- **0 companies/recruiters** extracted (pipeline stalled)
+
+---
+
+## BUSINESS LOGIC SCHEMA DESIGN
+
+### Core Entity Model
+```
+EMAILS (Central Hub)
+├── COMPANIES (Normalized business entities)
+├── RECRUITERS (Contact information)
+├── POSITIONS (Job opportunities)
+├── STRUCTURED_EXTRACTIONS (Raw HF output)
+└── Support Tables (attachments, hashes, errors)
+```
+
+### Deduplication Strategy
+**Primary Method**: Content checksums in `email_hashes` table
+```sql
+-- Checksum-based deduplication (your preferred approach)
+SELECT body_hash, COUNT(*) as duplicates 
+FROM email_hashes 
+GROUP BY body_hash 
+HAVING COUNT(*) > 1;
+```
+
+**Alternative**: UID-based (current system, you want to abandon)
+```sql
+-- UID-based processing (to be replaced)
+SELECT uid, COUNT(*) as duplicates 
+FROM emails 
+WHERE uid IS NOT NULL 
+GROUP BY uid 
+HAVING COUNT(*) > 1;
+```
+
+### Business Rule Processing
+The schema supports business rule-driven processing instead of UID sequences:
+
+**Sender Pattern Classification**:
+```sql
+UPDATE emails 
+SET email_type = 'RECRUITER'
+WHERE sender SIMILAR TO '%@(staffing|recruiting|talent|hr)%'
+AND email_type = 'OTHER';
+```
+
+**Content-Based Classification**:
+```sql
+UPDATE emails 
+SET email_type = 'RECRUITER'
+WHERE (
+    LOWER(subject) SIMILAR TO '%(job|position|opportunity|career|hiring|role)%'
+    OR LOWER(body_text) SIMILAR TO '%(salary|compensation|benefits|interview)%'
+)
+AND email_type = 'OTHER';
+```
+
+**Relationship-Driven Processing**:
+```sql
+-- Process based on known recruiters, not UID order
+SELECT e.* FROM emails e
+JOIN recruiters r ON LOWER(TRIM(e.sender)) = LOWER(TRIM(r.email))
+WHERE e.analysis_status = 'pending'
+ORDER BY e.extraction_confidence DESC, e.date_received DESC;
+```
+
+---
+
+## TABLE SCHEMAS WITH BUSINESS CONTEXT
+
+### 1. EMAILS (Primary Data Table)
+**Purpose**: Central email repository with processing metadata
+**Business Rules**:
+- Content-based deduplication via `email_hashes`
+- Classification into RECRUITER/OTHER types
+- Processing status tracking for HF model pipeline
+
+```sql
+CREATE TABLE public.emails (
+    id integer NOT NULL,
+    uid bigint,                         -- IMAP UID (to be deprecated)
+    folder_name text,
+    message_id text,                    -- RFC Message-ID header
+    subject text,
+    sender text,                        -- Primary business identifier
+    recipients text,
+    date_sent timestamp with time zone,
+    date_received timestamp with time zone,
+    body_text text,                     -- Content for analysis
+    body_html text,
+    size_bytes bigint,
+    has_attachments boolean DEFAULT false,
+    account_id integer,
+    processed_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
+    email_type text DEFAULT 'unknown'::text,    -- RECRUITER/OTHER
+    analysis_status text DEFAULT 'pending'::text, -- Processing pipeline status
+    analysis_attempts integer DEFAULT 0,
+    last_analysis_error text,
+    email_category text,                -- Fine-grained classification
+    category_confidence numeric(3,2)    -- Classification confidence
+);
+```
+
+### 2. EMAIL_HASHES (Deduplication System)
+**Purpose**: Content-based duplicate detection
+**Business Logic**: Same hash = identical content, regardless of UID
+
+```sql
+CREATE TABLE public.email_hashes (
+    email_id integer NOT NULL,
+    body_hash text NOT NULL,            -- SHA-256 of email content
+    created_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT email_hashes_body_hash_key UNIQUE (body_hash)
+);
+```
+
+### 3. COMPANIES (Business Entity Extraction)
+**Purpose**: Normalized company information from recruitment emails
+**Business Value**: Company intelligence for negotiation and research
+
+```sql
+CREATE TABLE public.companies (
+    id integer NOT NULL,
+    name text NOT NULL,                 -- Primary company identifier
+    legal_name text,
+    domain text,                        -- Email domain matching
+    industry text,                      -- Industry classification
+    company_size text,                  -- Employee count category
+    employee_count_min integer,
+    employee_count_max integer,
+    headquarters_location text,
+    founded_year integer,
+    stock_symbol text,
+    company_type text,                  -- Public/private/startup
+    glassdoor_rating numeric(3,2),
+    linkedin_url text,
+    website_url text,
+    description text,
+    extraction_confidence numeric(3,2), -- Quality scoring
+    extraction_source text,
+    extraction_notes text,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT valid_name_length CHECK ((length(name) > 0))
+);
+```
+
+### 4. RECRUITERS (Contact Management)
+**Purpose**: Recruiter relationship tracking and contact information
+**Business Value**: Relationship mapping and communication history
+
+```sql
+CREATE TABLE public.recruiters (
+    id integer NOT NULL,
+    name text NOT NULL,
+    email text,                         -- Primary contact method
+    company_id integer,                 -- Links to companies table
+    phone text,
+    linkedin_url text,
+    title text,
+    years_experience integer,
+    timezone text,
+    preferred_contact_method text,
+    name_variations text[],             -- Handle name variations
+    email_variations text[],            -- Multiple email addresses
+    phone_variations text[],
+    extraction_confidence numeric(3,2),
+    extraction_source text,
+    first_seen_email_id integer,       -- Relationship history
+    last_seen_email_id integer,
+    interaction_count integer DEFAULT 0,
+    created_at timestamp with time zone DEFAULT now(),
+    updated_at timestamp with time zone DEFAULT now(),
+    CONSTRAINT valid_recruiter_data CHECK (((length(COALESCE(name, ''::text)) > 0) OR (length(COALESCE(email, ''::text)) > 0)))
+);
+```
+
+### 5. POSITIONS (Job Opportunity Tracking)
+**Purpose**: Structured job posting data extraction
+**Business Value**: Opportunity analysis, salary benchmarking, skill tracking
+
+```sql
+CREATE TABLE public.positions (
+    id integer NOT NULL,
+    recruiter_id integer,               -- Links to recruiters table
+    external_job_id text,
+    job_title text NOT NULL,            -- Primary position identifier
+    recruiting_company_id integer,      -- Agency/recruiting firm
+    client_company_id integer,          -- Actual hiring company
+    department text,
+    seniority_level text,               -- Junior/mid/senior/executive
+    location text,
+    remote_type text,                   -- Remote/hybrid/onsite
+    remote_percentage integer,
+    job_type text,                      -- Full-time/contract/temporary
+    duration_months integer,
+    status text DEFAULT 'new'::text,
+    priority_level integer DEFAULT 3,
+    salary_min numeric(12,2),           -- Compensation analysis
+    salary_max numeric(12,2),
+    salary_currency text DEFAULT 'USD'::text,
+    hourly_rate_min numeric(8,2),
+    hourly_rate_max numeric(8,2),
+    compensation_type text,
+    structure_type text,
+    required_skills text[],             -- Skills matching
+    preferred_skills text[],
+    key_technologies text[],
+    extraction_confidence numeric(3,2),
+    extraction_source text,
+    source_email_id integer,            -- Links back to emails
+    first_contacted timestamp with time zone,
+    last_updated timestamp with time zone DEFAULT now(),
+    closes_date timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now(),
+    employment_type character varying(10),
+    title character varying(200),
+    CONSTRAINT valid_job_title CHECK ((length(job_title) > 1))
+);
+```
+
+### 6. STRUCTURED_EXTRACTIONS (HF Model Output)
+**Purpose**: Raw HuggingFace model extraction results
+**Processing Flow**: Raw model output → normalization → business entities
+
+```sql
+CREATE TABLE public.structured_extractions (
+    id integer NOT NULL,
+    email_id integer,
+    data_type character varying(50),    -- Type of extracted data
+    extracted_value text,               -- Raw extracted value
+    confidence_score numeric(3,2),      -- Model confidence score
+    extraction_method character varying(50),
+    needs_review boolean DEFAULT false,  -- Quality control flag
+    created_at timestamp without time zone DEFAULT now()
+);
+```
+
+---
+
+## ANALYTICAL VIEWS FOR BUSINESS INTELLIGENCE
+
+### 1. Position Opportunities Analysis
+```sql
+CREATE VIEW position_opportunities AS
+SELECT 
+    p.id,
+    p.job_title,
+    p.salary_min,
+    p.salary_max,
+    p.compensation_type,
+    p.structure_type,
+    p.location,
+    p.remote_type,
+    p.job_type,
+    r.name AS recruiter_name,
+    r.email AS recruiter_email,
+    rc.name AS recruiting_company,
+    cc.name AS client_company,
+    p.extraction_confidence,
+    p.created_at
+FROM positions p
+LEFT JOIN recruiters r ON p.recruiter_id = r.id
+LEFT JOIN companies rc ON p.recruiting_company_id = rc.id
+LEFT JOIN companies cc ON p.client_company_id = cc.id
+ORDER BY p.extraction_confidence DESC, p.created_at DESC;
+```
+
+### 2. Recruiter Relationship Summary
+```sql
+CREATE VIEW recruiter_summary AS
+SELECT 
+    r.id,
+    r.name,
+    r.email,
+    r.phone,
+    c.name AS company_name,
+    r.title,
+    count(p.id) AS positions_offered,
+    r.extraction_confidence,
+    r.interaction_count,
+    r.created_at
+FROM recruiters r
+LEFT JOIN companies c ON r.company_id = c.id
+LEFT JOIN positions p ON r.id = p.recruiter_id
+GROUP BY r.id, r.name, r.email, r.phone, c.name, r.title, 
+         r.extraction_confidence, r.interaction_count, r.created_at
+ORDER BY r.extraction_confidence DESC, r.interaction_count DESC;
+```
+
+### 3. Processing Progress Monitoring
+```sql
+CREATE VIEW extraction_progress AS
+SELECT 
+    extraction_sessions.session_epoch,
+    extraction_sessions.model_name,
+    extraction_sessions.session_start,
+    extraction_sessions.processed_emails,
+    extraction_sessions.total_emails,
+    CASE
+        WHEN extraction_sessions.total_emails > 0 
+        THEN round(extraction_sessions.processed_emails::numeric / extraction_sessions.total_emails::numeric * 100::numeric, 2)
+        ELSE 0::numeric
+    END AS progress_percentage,
+    extraction_sessions.recruiter_emails_found,
+    extraction_sessions.recruiters_extracted,
+    extraction_sessions.companies_extracted,
+    extraction_sessions.positions_extracted,
+    extraction_sessions.avg_processing_time_ms,
+    EXTRACT(epoch FROM COALESCE(extraction_sessions.session_end, now()) - extraction_sessions.session_start) / 60::numeric AS runtime_minutes
+FROM extraction_sessions
+ORDER BY extraction_sessions.session_epoch DESC;
+```
+
+---
+
+## BUSINESS RULE IMPLEMENTATION EXAMPLES
+
+### Content-Based Email Processing
+```sql
+-- Identify recruiter emails by content patterns
+WITH recruiter_patterns AS (
+    SELECT id, sender, subject, body_text,
+    CASE 
+        WHEN sender SIMILAR TO '%@(staffing|recruiting|talent|hr|headhunt)%' THEN 1
+        WHEN LOWER(subject) SIMILAR TO '%(job|position|opportunity|career|hiring|role)%' THEN 1
+        WHEN LOWER(body_text) SIMILAR TO '%(salary|compensation|benefits|interview|resume)%' THEN 1
+        ELSE 0
+    END as recruiter_score
+    FROM emails
+    WHERE email_type = 'OTHER'
+)
+UPDATE emails 
+SET email_type = 'RECRUITER'
+WHERE id IN (
+    SELECT id FROM recruiter_patterns WHERE recruiter_score > 0
+);
+```
+
+### Relationship-Driven Processing Priority
+```sql
+-- Process emails based on business value, not UID sequence
+WITH priority_emails AS (
+    SELECT e.id, e.sender, e.subject,
+    CASE 
+        WHEN r.id IS NOT NULL THEN 1        -- Known recruiter
+        WHEN c.id IS NOT NULL THEN 2        -- Known company domain
+        WHEN e.email_type = 'RECRUITER' THEN 3
+        ELSE 4
+    END as priority_level
+    FROM emails e
+    LEFT JOIN recruiters r ON LOWER(TRIM(e.sender)) = LOWER(TRIM(r.email))
+    LEFT JOIN companies c ON SPLIT_PART(e.sender, '@', 2) = c.domain
+    WHERE e.analysis_status = 'pending'
+)
+SELECT * FROM priority_emails
+ORDER BY priority_level ASC, date_received DESC
+LIMIT 50;
+```
+
+### Checksum-Based Deduplication
+```sql
+-- True content deduplication using checksums
+WITH duplicate_content AS (
+    SELECT eh.body_hash, array_agg(eh.email_id) as email_ids, COUNT(*) as duplicate_count
+    FROM email_hashes eh
+    GROUP BY eh.body_hash
+    HAVING COUNT(*) > 1
+)
+SELECT 
+    dc.body_hash,
+    dc.duplicate_count,
+    string_agg(e.sender, '; ') as senders,
+    string_agg(e.subject, '; ') as subjects
+FROM duplicate_content dc
+JOIN emails e ON e.id = ANY(dc.email_ids)
+GROUP BY dc.body_hash, dc.duplicate_count
+ORDER BY dc.duplicate_count DESC;
+```
+
+---
+
+## MIGRATION FROM UID-BASED TO BUSINESS-RULE PROCESSING
+
+### Current UID-Based Approach (To Be Replaced)
+```sql
+-- Sequential UID processing (your concern)
+SELECT * FROM emails 
+WHERE uid > $last_processed_uid 
+ORDER BY uid ASC 
+LIMIT 100;
+```
+
+### Proposed Business-Rule Approach
+```sql
+-- Content and relationship-driven processing
+WITH processing_queue AS (
+    SELECT e.*, 
+           -- Priority scoring based on business rules
+           CASE 
+               WHEN r.interaction_count > 5 THEN 1        -- High-value recruiters
+               WHEN p.salary_max > 150000 THEN 2          -- High-value positions
+               WHEN e.date_received > NOW() - INTERVAL '7 days' THEN 3  -- Recent emails
+               WHEN e.email_type = 'RECRUITER' THEN 4     -- Classified recruiters
+               ELSE 5                                     -- Other emails
+           END as business_priority,
+           -- Deduplication check
+           eh.body_hash IS NOT NULL as has_checksum
+    FROM emails e
+    LEFT JOIN email_hashes eh ON e.id = eh.email_id
+    LEFT JOIN recruiters r ON LOWER(TRIM(e.sender)) = LOWER(TRIM(r.email))
+    LEFT JOIN positions p ON e.id = p.source_email_id
+    WHERE e.analysis_status = 'pending'
+    AND eh.body_hash IS NOT NULL  -- Only process emails with checksums
+)
+SELECT * FROM processing_queue
+ORDER BY business_priority ASC, date_received DESC
+LIMIT 50;
+```
+
+This approach prioritizes:
+1. **Known high-value recruiters** (frequent contacts)
+2. **High-salary positions** (valuable opportunities)
+3. **Recent emails** (time-sensitive content)
+4. **Classified recruiter emails** (confirmed relevant content)
+5. **Content-verified emails** (checksum exists = real content)
+
+---
+
+## SUMMARY
+
+**Complete Recreation Capability**: YES
+- **DDL File**: `candidate.ddl.1758228125.sql` (1,106 lines)
+- **Recreation Command**: Single psql command recreates entire schema
+- **Documentation**: Full business context and implementation guidance
+
+**Business Rule Support**: COMPREHENSIVE
+- **Content-based identification** replaces UID sequences
+- **Relationship-driven processing** prioritizes business value
+- **Checksum deduplication** ensures true duplicate detection
+- **Quality control** with confidence scoring and manual review
+
+**Current State**: Ready for business rule implementation
+- Schema supports abandoning UID-based processing
+- All necessary indexes and constraints in place
+- Analytical views provide business intelligence
+- Migration path from technical to business-driven processing clearly defined
+
+The schema is designed to support your desired shift from UID-based technical processing to business rule-driven content analysis.

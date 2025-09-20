@@ -1,0 +1,543 @@
+# CREWAI-IMAP DATABASE SCHEMA DOCUMENTATION
+Generated: 2025-01-19 @ epoch 1758228125
+
+## OVERVIEW
+Complete documentation of the PostgreSQL database schema for the CrewAI IMAP agent system. This system processes emails to extract recruitment intelligence using HuggingFace model analysis and structured data extraction.
+
+## DATABASE: crewai_imap
+- **Host**: localhost:5432 (Docker container: postgres)
+- **Engine**: PostgreSQL 15
+- **Current Status**: 585 emails, 54 recruiter emails, 0 processed extractions
+- **Storage**: 2.44MB emails table, minimal other tables
+
+## CORE DATA FLOW
+1. **Email Ingestion**: IMAP → emails table
+2. **Classification**: Email type detection (RECRUITER/OTHER)
+3. **HF Analysis**: Microsoft Phi-3-mini-4k-instruct model processing
+4. **Structured Extraction**: Companies, recruiters, positions extraction
+5. **Quality Control**: Confidence scoring, error tracking, manual review
+
+---
+
+## TABLE SCHEMAS
+
+### 1. EMAILS (Primary Data Table)
+**Purpose**: Central email storage with metadata and processing status
+**Size**: 2.44MB (585 rows)
+
+```sql
+CREATE TABLE emails (
+    id                  SERIAL PRIMARY KEY,
+    uid                 BIGINT,                    -- IMAP UID (nullable)
+    folder_name         TEXT,                      -- IMAP folder
+    message_id          TEXT,                      -- Email Message-ID header
+    subject             TEXT,                      -- Email subject
+    sender              TEXT,                      -- From address
+    recipients          TEXT,                      -- To/CC addresses
+    date_sent           TIMESTAMPTZ,               -- Date header
+    date_received       TIMESTAMPTZ,               -- IMAP received date
+    body_text           TEXT,                      -- Plain text body
+    body_html           TEXT,                      -- HTML body
+    size_bytes          BIGINT,                    -- Email size
+    has_attachments     BOOLEAN DEFAULT FALSE,     -- Attachment flag
+    account_id          INTEGER,                   -- IMAP account reference
+    processed_at        TIMESTAMPTZ DEFAULT NOW(), -- Ingestion timestamp
+    email_type          TEXT DEFAULT 'unknown',    -- RECRUITER/OTHER/unknown
+    analysis_status     TEXT DEFAULT 'pending',    -- pending/completed/failed
+    analysis_attempts   INTEGER DEFAULT 0,         -- Retry counter
+    last_analysis_error TEXT,                      -- Latest error message
+    email_category      TEXT,                      -- Fine-grained category
+    category_confidence NUMERIC(3,2)               -- Category confidence score
+);
+```
+
+**Indexes**:
+- `emails_pkey`: Primary key (id)
+- `idx_emails_analysis_status`: Analysis status lookup
+- `idx_emails_date_received`: Chronological ordering
+- `idx_emails_sender`: Sender-based queries
+- `idx_emails_type`: Email type filtering
+
+**Current Data**:
+- 585 total emails
+- 54 RECRUITER type (9.2%)
+- 531 OTHER type (90.8%)
+- 15 pending analysis
+- 106 emails in last 24h
+
+---
+
+### 2. COMPANIES (Business Entity Extraction)
+**Purpose**: Normalized company information extracted from emails
+**Size**: 16KB (0 rows currently)
+
+```sql
+CREATE TABLE companies (
+    id                    SERIAL PRIMARY KEY,
+    name                  TEXT NOT NULL,           -- Company display name
+    legal_name            TEXT,                    -- Legal business name
+    domain                TEXT,                    -- Email domain
+    industry              TEXT,                    -- Industry classification
+    company_size          TEXT,                    -- Size category
+    employee_count_min    INTEGER,                 -- Employee range min
+    employee_count_max    INTEGER,                 -- Employee range max
+    headquarters_location TEXT,                    -- HQ location
+    founded_year          INTEGER,                 -- Foundation year
+    stock_symbol          TEXT,                    -- Stock ticker
+    company_type          TEXT,                    -- Public/private/startup
+    glassdoor_rating      NUMERIC(3,2),            -- Glassdoor rating
+    linkedin_url          TEXT,                    -- LinkedIn company page
+    website_url           TEXT,                    -- Corporate website
+    description           TEXT,                    -- Company description
+    extraction_confidence NUMERIC(3,2),            -- Extraction quality score
+    extraction_source     TEXT,                    -- Source identification
+    extraction_notes      TEXT,                    -- Extraction metadata
+    created_at            TIMESTAMPTZ DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Indexes**:
+- `companies_pkey`: Primary key
+- `idx_companies_name_dedup`: Unique name constraint (case-insensitive, trimmed)
+- `idx_companies_confidence`: Quality ordering
+- `idx_companies_industry`: Industry grouping
+- `idx_companies_size`: Size-based queries
+
+**Constraints**:
+- `valid_name_length`: Name must be non-empty
+- Unique index prevents duplicate company names
+
+---
+
+### 3. RECRUITERS (Contact Extraction)
+**Purpose**: Individual recruiter contact information and relationship tracking
+**Size**: 8KB (0 rows currently)
+
+```sql
+CREATE TABLE recruiters (
+    id                       SERIAL PRIMARY KEY,
+    name                     TEXT NOT NULL,       -- Recruiter full name
+    email                    TEXT,                -- Primary email
+    company_id               INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+    phone                    TEXT,                -- Phone number
+    linkedin_url             TEXT,                -- LinkedIn profile
+    title                    TEXT,                -- Job title
+    years_experience         INTEGER,             -- Experience level
+    timezone                 TEXT,                -- Preferred timezone
+    preferred_contact_method TEXT,                -- Contact preference
+    name_variations          TEXT[],              -- Alternative name spellings
+    email_variations         TEXT[],              -- Alternative emails
+    phone_variations         TEXT[],              -- Alternative phones
+    extraction_confidence    NUMERIC(3,2),        -- Extraction quality
+    extraction_source        TEXT,                -- Source identification
+    first_seen_email_id      INTEGER REFERENCES emails(id),
+    last_seen_email_id       INTEGER REFERENCES emails(id),
+    interaction_count        INTEGER DEFAULT 0,   -- Email interaction count
+    created_at               TIMESTAMPTZ DEFAULT NOW(),
+    updated_at               TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Indexes**:
+- `recruiters_pkey`: Primary key
+- `idx_recruiters_email_dedup`: Unique email constraint (case-insensitive)
+- `idx_recruiters_company`: Company affiliation lookup
+- `idx_recruiters_confidence`: Quality ordering
+- `idx_recruiters_interaction_count`: Activity-based ranking
+
+**Constraints**:
+- `valid_recruiter_data`: Must have either name or email
+- Email uniqueness with validation (contains @, proper format)
+
+---
+
+### 4. POSITIONS (Job Opportunity Extraction)
+**Purpose**: Job posting and opportunity data extracted from recruitment emails
+**Size**: 16KB (10 rows currently)
+
+```sql
+CREATE TABLE positions (
+    id                    SERIAL PRIMARY KEY,
+    recruiter_id          INTEGER REFERENCES recruiters(id) ON DELETE SET NULL,
+    external_job_id       TEXT,                    -- External job reference
+    job_title             TEXT NOT NULL,           -- Position title
+    recruiting_company_id INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+    client_company_id     INTEGER REFERENCES companies(id) ON DELETE SET NULL,
+    department            TEXT,                    -- Department/team
+    seniority_level       TEXT,                    -- Junior/mid/senior/exec
+    location              TEXT,                    -- Job location
+    remote_type           TEXT,                    -- Remote/hybrid/onsite
+    remote_percentage     INTEGER,                 -- % remote work
+    job_type              TEXT,                    -- Full-time/contract/etc
+    duration_months       INTEGER,                 -- Contract duration
+    status                TEXT DEFAULT 'new',      -- Opportunity status
+    priority_level        INTEGER DEFAULT 3,       -- Priority ranking
+    salary_min            NUMERIC(12,2),           -- Salary range minimum
+    salary_max            NUMERIC(12,2),           -- Salary range maximum
+    salary_currency       TEXT DEFAULT 'USD',      -- Currency code
+    hourly_rate_min       NUMERIC(8,2),            -- Hourly rate minimum
+    hourly_rate_max       NUMERIC(8,2),            -- Hourly rate maximum
+    compensation_type     TEXT,                    -- Salary/hourly/equity
+    structure_type        TEXT,                    -- Fixed/variable/commission
+    required_skills       TEXT[],                  -- Must-have skills
+    preferred_skills      TEXT[],                  -- Nice-to-have skills
+    key_technologies      TEXT[],                  -- Technology stack
+    extraction_confidence NUMERIC(3,2),            -- Extraction quality
+    extraction_source     TEXT,                    -- Source identification
+    source_email_id       INTEGER REFERENCES emails(id),
+    first_contacted       TIMESTAMPTZ,             -- Initial contact date
+    last_updated          TIMESTAMPTZ DEFAULT NOW(),
+    closes_date           TIMESTAMPTZ,             -- Application deadline
+    created_at            TIMESTAMPTZ DEFAULT NOW(),
+    employment_type       VARCHAR(10),             -- Employment classification
+    title                 VARCHAR(200)             -- Alternative title field
+);
+```
+
+**Indexes**:
+- `positions_pkey`: Primary key
+- `idx_positions_recruiter`: Recruiter-based queries
+- `idx_positions_client_company`: Client company lookup
+- `idx_positions_remote_type`: Remote work filtering
+- `idx_positions_salary_range`: Salary-based searches
+- `idx_positions_job_type`: Job type filtering
+- `idx_positions_confidence`: Quality ordering
+
+**Constraints**:
+- `valid_job_title`: Title must be > 1 character
+
+---
+
+### 5. STRUCTURED_EXTRACTIONS (HF Model Output)
+**Purpose**: Raw structured data extracted by HuggingFace model
+**Size**: 8KB (0 rows currently)
+
+```sql
+CREATE TABLE structured_extractions (
+    id                SERIAL PRIMARY KEY,
+    email_id          INTEGER REFERENCES emails(id),
+    data_type         VARCHAR(50),                -- Type of extracted data
+    extracted_value   TEXT,                       -- Raw extracted value
+    confidence_score  NUMERIC(3,2),               -- Model confidence
+    extraction_method VARCHAR(50),                -- Extraction approach
+    needs_review      BOOLEAN DEFAULT FALSE,      -- Manual review flag
+    created_at        TIMESTAMP DEFAULT NOW()     -- Extraction timestamp
+);
+```
+
+**Purpose**: Stores raw HF model extractions before normalization into business entities.
+
+---
+
+### 6. EXTRACTION_ATTEMPTS (Processing Audit Trail)
+**Purpose**: Detailed logging of every HF model processing attempt
+**Size**: 8KB (0 rows currently)
+
+```sql
+CREATE TABLE extraction_attempts (
+    id                 SERIAL PRIMARY KEY,
+    email_id           INTEGER REFERENCES emails(id) ON DELETE CASCADE,
+    session_epoch      BIGINT REFERENCES extraction_sessions(session_epoch),
+    extraction_type    TEXT NOT NULL,              -- Type of extraction
+    llm_prompt         TEXT,                       -- Sent to model
+    llm_response       TEXT,                       -- Model response
+    processing_time_ms INTEGER,                    -- Processing duration
+    success            BOOLEAN DEFAULT FALSE,      -- Success flag
+    error_message      TEXT,                       -- Error details
+    extracted_data     JSONB,                      -- Structured output
+    confidence_score   NUMERIC(3,2),               -- Overall confidence
+    created_at         TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Indexes**:
+- `idx_extraction_attempts_email`: Email-based queries
+- `idx_extraction_attempts_session`: Session grouping
+- `idx_extraction_attempts_type`: Type-based analysis
+
+---
+
+### 7. EXTRACTION_SESSIONS (Batch Processing Tracking)
+**Purpose**: High-level session tracking for batch processing runs
+**Size**: 8KB (0 rows currently)
+
+```sql
+CREATE TABLE extraction_sessions (
+    session_epoch         BIGINT PRIMARY KEY,      -- Unix timestamp
+    model_name            TEXT,                    -- HF model identifier
+    session_start         TIMESTAMPTZ DEFAULT NOW(),
+    session_end           TIMESTAMPTZ,             -- Completion time
+    processed_emails      INTEGER DEFAULT 0,       -- Emails processed
+    total_emails          INTEGER DEFAULT 0,       -- Total target emails
+    recruiter_emails_found INTEGER DEFAULT 0,      -- Recruiter emails found
+    recruiters_extracted  INTEGER DEFAULT 0,       -- Recruiters extracted
+    companies_extracted   INTEGER DEFAULT 0,       -- Companies extracted
+    positions_extracted   INTEGER DEFAULT 0,       -- Positions extracted
+    avg_processing_time_ms INTEGER,                -- Average processing time
+    session_notes         TEXT                     -- Session metadata
+);
+```
+
+---
+
+### 8. EMAIL_HASHES (Deduplication System)
+**Purpose**: Content-based deduplication using checksums
+**Size**: 8KB (0 rows currently)
+
+```sql
+CREATE TABLE email_hashes (
+    email_id    INTEGER NOT NULL REFERENCES emails(id) ON DELETE CASCADE,
+    body_hash   TEXT NOT NULL,                   -- Content checksum
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(body_hash)                            -- Prevent duplicate content
+);
+```
+
+**Critical Feature**: This table implements the checksum-based deduplication you mentioned. Same checksum = same email content.
+
+---
+
+### 9. SUPPORT TABLES
+
+#### EMAIL_ATTACHMENTS
+```sql
+CREATE TABLE email_attachments (
+    id              SERIAL PRIMARY KEY,
+    email_id        INTEGER REFERENCES emails(id) ON DELETE CASCADE,
+    filename        TEXT,
+    content_type    TEXT,
+    size_bytes      BIGINT,
+    attachment_data BYTEA                        -- Binary attachment data
+);
+```
+
+#### EXTRACTION_ERRORS
+```sql
+CREATE TABLE extraction_errors (
+    id                SERIAL PRIMARY KEY,
+    email_id          INTEGER REFERENCES emails(id),
+    error_type        VARCHAR(50),
+    error_details     TEXT,
+    confidence_score  NUMERIC(3,2),
+    extraction_method VARCHAR(50),
+    created_at        TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### MANUAL_CORRECTIONS
+```sql
+CREATE TABLE manual_corrections (
+    id               SERIAL PRIMARY KEY,
+    extraction_id    INTEGER REFERENCES structured_extractions(id),
+    original_value   TEXT,
+    corrected_value  TEXT,
+    correction_type  VARCHAR(50),
+    corrected_by     TEXT,
+    correction_notes TEXT,
+    created_at       TIMESTAMP DEFAULT NOW()
+);
+```
+
+#### LEARNED_PATTERNS
+```sql
+CREATE TABLE learned_patterns (
+    id                    SERIAL PRIMARY KEY,
+    pattern_type          VARCHAR(50),
+    pattern_regex         TEXT,
+    pattern_description   TEXT,
+    confidence_threshold  NUMERIC(3,2),
+    usage_count          INTEGER DEFAULT 0,
+    success_rate         NUMERIC(5,2),
+    created_at           TIMESTAMP DEFAULT NOW(),
+    last_used_at         TIMESTAMP
+);
+```
+
+#### EMAIL_CATEGORIES
+```sql
+CREATE TABLE email_categories (
+    id                SERIAL PRIMARY KEY,
+    category_name     VARCHAR(50) UNIQUE NOT NULL,
+    parent_category   INTEGER REFERENCES email_categories(id),
+    description       TEXT,
+    classification_rules JSONB,
+    auto_classify     BOOLEAN DEFAULT TRUE,
+    created_at        TIMESTAMP DEFAULT NOW()
+);
+```
+
+---
+
+## ANALYTICAL VIEWS
+
+### 1. EXTRACTION_PROGRESS
+**Purpose**: Real-time processing progress monitoring
+```sql
+CREATE VIEW extraction_progress AS
+SELECT 
+    session_epoch,
+    model_name,
+    session_start,
+    processed_emails,
+    total_emails,
+    CASE 
+        WHEN total_emails > 0 
+        THEN ROUND(processed_emails::numeric / total_emails::numeric * 100, 2)
+        ELSE 0 
+    END AS progress_percentage,
+    recruiter_emails_found,
+    recruiters_extracted,
+    companies_extracted,
+    positions_extracted,
+    avg_processing_time_ms,
+    EXTRACT(EPOCH FROM COALESCE(session_end, NOW()) - session_start) / 60 AS runtime_minutes
+FROM extraction_sessions
+ORDER BY session_epoch DESC;
+```
+
+### 2. POSITION_OPPORTUNITIES
+**Purpose**: Comprehensive job opportunity analysis
+```sql
+CREATE VIEW position_opportunities AS
+SELECT 
+    p.id,
+    p.job_title,
+    p.salary_min,
+    p.salary_max,
+    p.compensation_type,
+    p.structure_type,
+    p.location,
+    p.remote_type,
+    p.job_type,
+    r.name AS recruiter_name,
+    r.email AS recruiter_email,
+    rc.name AS recruiting_company,
+    cc.name AS client_company,
+    p.extraction_confidence,
+    p.created_at
+FROM positions p
+LEFT JOIN recruiters r ON p.recruiter_id = r.id
+LEFT JOIN companies rc ON p.recruiting_company_id = rc.id
+LEFT JOIN companies cc ON p.client_company_id = cc.id
+ORDER BY p.extraction_confidence DESC, p.created_at DESC;
+```
+
+### 3. RECRUITER_SUMMARY
+**Purpose**: Recruiter relationship and activity analysis
+```sql
+CREATE VIEW recruiter_summary AS
+SELECT 
+    r.id,
+    r.name,
+    r.email,
+    r.phone,
+    c.name AS company_name,
+    r.title,
+    COUNT(p.id) AS positions_offered,
+    r.extraction_confidence,
+    r.interaction_count,
+    r.created_at
+FROM recruiters r
+LEFT JOIN companies c ON r.company_id = c.id
+LEFT JOIN positions p ON r.id = p.recruiter_id
+GROUP BY r.id, r.name, r.email, r.phone, c.name, r.title, 
+         r.extraction_confidence, r.interaction_count, r.created_at
+ORDER BY r.extraction_confidence DESC, r.interaction_count DESC;
+```
+
+---
+
+## DATA PROCESSING APPROACH
+
+### 1. EMAIL INGESTION PIPELINE
+1. **IMAP Connection**: Connect to email server
+2. **Folder Scanning**: Process INBOX and other folders
+3. **UID Management**: Track IMAP UIDs (but you want to abandon this)
+4. **Content Extraction**: Parse headers, body, attachments
+5. **Deduplication**: Use email_hashes table for checksum matching
+6. **Classification**: Initial RECRUITER/OTHER classification
+
+### 2. HF MODEL PROCESSING
+1. **Model**: Microsoft Phi-3-mini-4k-instruct (port 8201)
+2. **Input**: Email content (subject + body)
+3. **Output**: Structured JSON with entities
+4. **Storage**: extraction_attempts table logs all attempts
+5. **Normalization**: Convert JSON to business entities
+
+### 3. BUSINESS RULE MATCHING (Your Desired Approach)
+Instead of UID-based processing, implement:
+- **Content Fingerprinting**: Use email_hashes for deduplication
+- **Sender Patterns**: Match based on sender domains/patterns
+- **Subject Analysis**: Rule-based subject line classification
+- **Content Keywords**: Business rule-based content classification
+- **Relationship Mapping**: Connect emails through business relationships
+
+### 4. QUALITY CONTROL SYSTEM
+- **Confidence Scoring**: All extractions have confidence scores
+- **Manual Review**: needs_review flags for low-confidence extractions
+- **Error Tracking**: Comprehensive error logging and analysis
+- **Pattern Learning**: learned_patterns table for improving accuracy
+- **Feedback Loop**: manual_corrections table for continuous improvement
+
+---
+
+## CURRENT SYSTEM STATUS
+
+### Database State
+- **585 emails total** (growing by ~106/day)
+- **54 recruiter emails** identified
+- **0 HF extractions completed** (pipeline stalled)
+- **15 emails pending analysis**
+- **10 positions** in database (manual/legacy data)
+
+### Processing Bottlenecks
+1. **HF Pipeline Stalled**: No structured_extractions despite 54 recruiter emails
+2. **Analysis Status**: All emails stuck in 'pending' state
+3. **Empty Business Entities**: No companies, recruiters extracted from current emails
+
+### Infrastructure
+- **PostgreSQL 15**: Container 'postgres' on port 5432
+- **HF Model**: phi-model container on port 8201
+- **Processing Agent**: crewai-imap system ready but inactive
+
+---
+
+## BUSINESS RULE IMPLEMENTATION STRATEGY
+
+To abandon UID-based processing in favor of business rules:
+
+### 1. Content-Based Identification
+```sql
+-- Use email_hashes for deduplication instead of UID
+SELECT COUNT(*) FROM email_hashes WHERE body_hash = $1;
+```
+
+### 2. Sender Pattern Matching
+```sql
+-- Identify recruitment patterns by sender domain
+SELECT sender, COUNT(*) 
+FROM emails 
+WHERE sender LIKE '%@staffing%' OR sender LIKE '%@recruiting%'
+GROUP BY sender;
+```
+
+### 3. Subject Classification Rules
+```sql
+-- Rule-based subject analysis
+UPDATE emails 
+SET email_type = 'RECRUITER'
+WHERE LOWER(subject) SIMILAR TO '%(job|position|opportunity|career|hiring)%'
+AND email_type = 'unknown';
+```
+
+### 4. Relationship-Based Processing
+```sql
+-- Process emails based on business relationships, not UID sequence
+SELECT e.* FROM emails e
+JOIN recruiters r ON LOWER(e.sender) = LOWER(r.email)
+WHERE e.analysis_status = 'pending'
+ORDER BY e.date_received DESC;
+```
+
+This schema provides a comprehensive foundation for recruitment intelligence extraction while supporting your desired move away from UID-based processing toward business rule-driven email analysis.

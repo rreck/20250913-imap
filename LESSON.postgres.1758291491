@@ -1,0 +1,212 @@
+# POSTGRESQL CONFLICT PREVENTION LESSON
+Generated: 2025-01-19 @ epoch 1758291491
+
+## SITUATION ANALYSIS
+Analyzed the IMAP agent codebase for potential database operations that could cause stuck transactions similar to the INSERT INTO emails issue we just fixed.
+
+## FINDINGS
+
+### Current Database Operations in Main Application:
+
+#### 1. **emails Table INSERT** ✅ FIXED
+**Location**: `/app/main.py:478`
+```sql
+INSERT INTO emails (
+    uid, folder_name, message_id, subject, sender, recipients,
+    date_sent, date_received, body_text, body_html, has_attachments, size_bytes
+) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (uid, folder_name) DO NOTHING  -- ✅ APPLIED
+RETURNING id
+```
+**Status**: **Protected against duplicate key conflicts**
+
+#### 2. **SELECT Queries** ✅ SAFE
+**Location**: `/app/main.py:618, 621`
+```sql
+SELECT COUNT(*) FROM emails
+SELECT COUNT(DISTINCT account_id) FROM emails  
+```
+**Status**: **Read-only operations, no conflict risk**
+
+#### 3. **Commented SELECT with JOIN** ⚠️ POTENTIAL ISSUE  
+**Location**: `/app/main.py:391` (currently commented out)
+```sql
+-- cursor.execute("SELECT id FROM emails WHERE sender = %s AND date_sent = %s AND account_id = (SELECT id FROM email_accounts WHERE email_address = %s)")
+```
+**Risk Level**: **Medium** - If re-enabled, could fail due to missing email_accounts records
+
+### Missing Database Operations (Not Currently in Main App):
+
+#### 4. **email_accounts Table Operations** ❌ MISSING
+**Issue**: The PostgreSQL logs showed attempts to INSERT into email_accounts, but **no such code exists in main.py**
+**Evidence**: 
+```
+ERROR: INSERT INTO email_accounts (username, email_address, display_name)
+VALUES ('rreck@rrecktek.com', 'rreck@rrecktek.com', 'rreck@rrecktek.com')
+ON CONFLICT (email_address) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+```
+**Source**: This INSERT is **not in the main application code** - likely from test files or external processes
+
+#### 5. **Potential Future Operations** ⚠️ NEEDS PROTECTION
+Based on the schema analysis, these tables will likely need INSERT operations:
+- `companies` table
+- `recruiters` table  
+- `positions` table
+- `structured_extractions` table
+- `email_hashes` table
+
+## PREVENTIVE MEASURES APPLIED
+
+### Single Change Made:
+**Added `ON CONFLICT (uid, folder_name) DO NOTHING`** to the emails INSERT statement.
+
+**This prevents**:
+- Duplicate key violations on email reprocessing
+- Stuck transactions from constraint failures
+- Processing loops on already-stored emails
+
+## LESSON LEARNED: PostgreSQL Conflict Prevention Strategy
+
+### 1. **Always Use ON CONFLICT for INSERT Operations**
+```sql
+-- GOOD: Prevents duplicate key conflicts
+INSERT INTO table_name (key_field, data) 
+VALUES (%s, %s) 
+ON CONFLICT (key_field) DO NOTHING;
+
+-- BAD: Can cause stuck transactions
+INSERT INTO table_name (key_field, data) 
+VALUES (%s, %s);
+```
+
+### 2. **Standard Conflict Resolution Patterns**
+
+#### Pattern A: Skip Duplicates (Data Ingestion)
+```sql
+INSERT INTO emails (uid, folder_name, ...) 
+VALUES (%s, %s, ...) 
+ON CONFLICT (uid, folder_name) DO NOTHING;
+```
+
+#### Pattern B: Update on Conflict (Upsert)
+```sql
+INSERT INTO companies (name, domain, ...) 
+VALUES (%s, %s, ...) 
+ON CONFLICT (name) DO UPDATE SET 
+    updated_at = NOW(),
+    domain = EXCLUDED.domain;
+```
+
+#### Pattern C: Skip and Return Existing ID
+```sql
+INSERT INTO recruiters (email, name, ...) 
+VALUES (%s, %s, ...) 
+ON CONFLICT (email) DO UPDATE SET updated_at = NOW()
+RETURNING id;
+```
+
+### 3. **Identify Conflict-Prone Operations**
+
+#### High Risk Operations:
+- **INSERTs without ON CONFLICT** ❌
+- **UPDATEs without WHERE conditions** ❌
+- **Foreign key operations on empty tables** ❌
+
+#### Medium Risk Operations:
+- **Batch INSERTs without transaction boundaries** ⚠️
+- **SELECTs with complex JOINs on large tables** ⚠️
+- **Operations during high concurrency** ⚠️
+
+#### Low Risk Operations:
+- **Simple SELECTs with indexes** ✅
+- **INSERTs with proper ON CONFLICT** ✅
+- **UPDATEs with specific WHERE clauses** ✅
+
+## RECOMMENDED APPROACH FOR FUTURE DATABASE OPERATIONS
+
+### Template for Safe INSERT Operations:
+```sql
+-- For unique business entities (companies, recruiters)
+INSERT INTO table_name (unique_field, data_fields...) 
+VALUES (%s, %s, ...) 
+ON CONFLICT (unique_field) DO UPDATE SET 
+    updated_at = NOW(),
+    field1 = EXCLUDED.field1
+RETURNING id;
+
+-- For event/log data (emails, extractions)  
+INSERT INTO table_name (composite_key_fields..., data_fields...) 
+VALUES (%s, %s, ...) 
+ON CONFLICT (composite_key_fields...) DO NOTHING
+RETURNING id;
+
+-- For reference/lookup data (accounts, categories)
+INSERT INTO table_name (key_field, data_fields...) 
+VALUES (%s, %s, ...) 
+ON CONFLICT (key_field) DO NOTHING;
+```
+
+### Error Handling Pattern:
+```python
+def safe_insert(cursor, table, data, conflict_fields):
+    try:
+        cursor.execute(f"""
+            INSERT INTO {table} (...) 
+            VALUES (%s, ...) 
+            ON CONFLICT ({conflict_fields}) DO NOTHING
+            RETURNING id
+        """, data)
+        result = cursor.fetchone()
+        return result[0] if result else None
+    except Exception as e:
+        logger.error(f"Insert failed for {table}: {e}")
+        return None
+```
+
+## IMPACT ASSESSMENT
+
+### Before Fix:
+- ❌ **Stuck transactions** on duplicate email processing
+- ❌ **Agent restart loops** due to constraint violations  
+- ❌ **No progress** through 55K+ email backlog
+- ❌ **Resource waste** from failed operations
+
+### After Fix:
+- ✅ **Graceful duplicate handling** via ON CONFLICT
+- ✅ **Continuous processing** without transaction locks
+- ✅ **Progress through email backlog** enabled
+- ✅ **Resource efficiency** improved
+
+## BROADER APPLICATION
+
+### This Lesson Applies To:
+1. **Any high-volume data ingestion** system
+2. **ETL processes** with potential duplicates
+3. **Real-time data processing** pipelines  
+4. **Batch processing** systems with retry logic
+5. **Multi-threaded applications** accessing shared data
+
+### PostgreSQL Best Practices Reinforced:
+- **Always anticipate conflicts** in INSERT operations
+- **Use ON CONFLICT appropriately** for business logic
+- **Design for idempotency** in data operations
+- **Test with realistic data volumes** and concurrency
+- **Monitor for stuck transactions** in production
+
+## CONCLUSION
+
+**Single Change Impact**: Adding `ON CONFLICT (uid, folder_name) DO NOTHING` to one INSERT statement prevented a systematic failure that was blocking processing of 55,753 emails.
+
+**Broader Lesson**: **Every INSERT operation should consider conflict scenarios** and implement appropriate resolution strategies. This is especially critical in:
+- Data ingestion systems
+- Batch processing operations  
+- Systems processing large backlogs
+- Applications with retry logic
+
+**Next Steps**: Apply this pattern to all future database operations in the IMAP agent, especially when implementing:
+- Company extraction → `companies` table
+- Recruiter extraction → `recruiters` table  
+- Position extraction → `positions` table
+- Content deduplication → `email_hashes` table
+
+**Key Takeaway**: **Defensive database programming prevents system-wide failures.** A single unprotected INSERT can block thousands of operations downstream.
